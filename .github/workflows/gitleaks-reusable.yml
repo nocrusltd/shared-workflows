@@ -1,0 +1,471 @@
+name: Secret scan (gitleaks, shared)
+
+# Blocks new secrets from being committed. ONE copy for every repository:
+# callers reference this file at a full commit SHA.
+#
+# How a repository uses it (.github/workflows/gitleaks.yml in the caller):
+#
+#   on:
+#     pull_request_target:
+#       # 'edited' too: a change of base branch is an 'edited' event
+#       types: [opened, synchronize, reopened, edited]
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#   jobs:
+#     gitleaks:
+#       uses: nocrusltd/shared-workflows/.github/workflows/gitleaks-reusable.yml@<full commit SHA on main>
+#       with:
+#         runs-on: ubuntu-latest   # or a self-hosted Linux x64 runner label
+#
+# PUBLIC repositories: use `pull_request` instead of `pull_request_target`.
+# GitHub blocks pull_request_target by default in public repositories from
+# 2026-12-02 unless an Actions event policy allows it. Under `pull_request` a
+# fork's pull request gets a read-only token and no secrets, which is all this
+# workflow needs; the trade-off is that the pull request's own copy of the
+# caller runs, so changes to the caller must be reviewed.
+#
+# pull_request_target, not pull_request: the caller that runs is the one on
+# the repository's DEFAULT branch (GitHub loads this event's workflow from
+# there since 2025-12-08, whatever branch the pull request targets), so a pull
+# request cannot edit or remove the scanner that checks it. A caller file on
+# any other branch is not what runs: a pull request into a release or staging
+# branch is scanned by the default branch's caller and the version it pins.
+# The ignore file is still read from the pull request's own base commit.
+# That trigger is safe here only because this workflow never
+# executes anything from the pull request, passes no secrets, and has a
+# read-only token. Do not add a step that builds, installs or runs PR content.
+#
+# What it scans: ONLY the commits a pull request or a push introduces, never
+# the full history. If that range cannot be established the job fails.
+# Two passes over that range: commit by commit, and once more as the single
+# net change the range makes to the base (see the scan step for why).
+# Exceptions: only a fingerprint in .gitleaksignore AS IT IS ON THE BASE
+# (pull request: the base commit; push: the previous tip). A pull request can
+# therefore not allow-list its own finding: the entry has to be merged first,
+# in a change a reviewer reads by itself. An inline "gitleaks:allow" comment
+# and a .gitleaks.toml in the repository are both ignored.
+#
+# Uses the open-source gitleaks binary (MIT), pinned by version and SHA-256.
+# The gitleaks-action is not used: it is under a proprietary licence since
+# v2.0.0 and needs a licence key for repositories owned by an organisation.
+# Results go to the job log and job summary with secret values redacted.
+# Nothing is uploaded and no repository secret is used.
+#
+# No concurrency group on purpose: every run scans its own complete range, so
+# runs never need to replace each other, and a re-run of an older run can
+# never cancel the scan of a newer commit.
+#
+# To repeat the scan by hand with the same flags, work in a DISPOSABLE clone
+# and delete its working-tree .gitleaksignore first (rm -f .gitleaksignore):
+# gitleaks reads that file as well as --gitleaks-ignore-path, so leaving it in
+# place would let the branch being scanned supply its own exceptions. The job
+# below does the same (the test suite shows a scan passes wrongly without it).
+# Then, from the clone's root (gitleaks 8.30.1, config = this workflow's
+# "Scan configuration" output):
+#   gitleaks git . --config <config> --gitleaks-ignore-path <dir holding the
+#     base .gitleaksignore> --redact --ignore-gitleaks-allow --no-banner \
+#     --exit-code 2 --log-opts="--diff-merges=remerge --text --no-renames <base>..<head>"
+# That is only the first pass (commit by commit). The second pass scans the net
+# change, which is where a token that reaches a scanned path only through a
+# merge shows up. To repeat it by hand for a push (<base> = the last tip known
+# to be good, <head> = the new tip):
+#   net=$(git commit-tree "<head>^{tree}" -p <base> -m "net change")
+#   gitleaks git . <the same flags> --log-opts="--text --no-renames <base>..$net"
+# A finding from this pass has no real commit id. The workflow drops one only
+# when the BASE branch's .gitleaksignore has an entry for the same
+# file:rule:line; by hand, check that against the base's copy of the file,
+# never the copy on the branch being scanned. A recovery scan is complete only
+# when both passes have been run.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label. A GitHub-hosted Linux x64 image or a self-hosted Linux x64 runner.
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks (new commits only)
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Self-hosted runners may be a bare actions-runner image. The steps below need
+      # curl, tar, sha256sum and jq; install whichever is missing, and stop
+      # on anything but x86_64 because the pinned archive is the x64 build.
+      - name: Tools (installs only what the runner lacks)
+        run: |
+          set -euo pipefail
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::runner is $(uname -m); the pinned gitleaks archive is linux_x64"; exit 1; }
+          missing=""
+          for c in curl tar sha256sum jq git; do command -v "$c" >/dev/null || missing="$missing $c"; done
+          [ -z "$missing" ] && exit 0
+          echo "installing:$missing"
+          pkgs=""
+          for c in $missing; do
+            case "$c" in
+              sha256sum) pkgs="$pkgs coreutils" ;;
+              *) pkgs="$pkgs $c" ;;
+            esac
+          done
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086 # one package per word, on purpose
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates $pkgs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # For a pull request this is the PR's head commit. It is DATA to be
+          # scanned: nothing in it is executed, and neither its ignore file nor
+          # any configuration in it is read (see the scan step).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # actions/checkout v7 refuses to check out a FORK pull request's head
+          # under pull_request_target unless this is set, because running a
+          # fork's code with the base repository's token is the classic
+          # "pwn request". It is set here because this job never runs that
+          # code: the remaining steps download a pinned binary and run git and
+          # gitleaks over the commits as data, with a read-only token, no
+          # secrets and no cache. Do not add a step that builds, installs or
+          # executes anything from the checkout.
+          allow-unsafe-pr-checkout: true
+          # Full history is needed to resolve the commit range. It is fetched,
+          # not scanned: the scan below is limited to the range.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (checksum verified)
+        env:
+          # Bump the version and the checksum together. The checksum is the
+          # linux_x64 line of gitleaks_<version>_checksums.txt on the release.
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$tmp/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $tmp/gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$tmp/gitleaks" "$RUNNER_TEMP/bin/gitleaks"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gitleaks" version
+
+      # gitleaks' default configuration skips whole file types by name: images,
+      # fonts, and documents and binaries (.pdf, .bin, .exe, .dll, .docx ...).
+      # A token committed in such a file would pass. The scan below asks git
+      # for the text of every file (--text), so those three exclusions are
+      # removed here and the rest of the default configuration is kept as it
+      # is. Still excluded by the defaults, on purpose: lock files, go.sum,
+      # vendored dependency directories, node_modules and the build wrappers
+      # (their hashes are noise, and a blocking check that cries wolf gets
+      # ignored).
+      - name: Scan configuration (default rules, without the file-type exclusions)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          # sha256 of config/gitleaks.toml at the v8.30.1 tag. Bump with the version.
+          GITLEAKS_CONFIG_SHA256: e163e53b9e7e8a8511e77271e2b323ed057759542a6d988258afe3a1fa329caf
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$tmp/default.toml" \
+            "https://raw.githubusercontent.com/gitleaks/gitleaks/v${GITLEAKS_VERSION}/config/gitleaks.toml"
+          echo "${GITLEAKS_CONFIG_SHA256}  $tmp/default.toml" | sha256sum --check --strict -
+          cat > "$tmp/drop" <<'DROP'
+          (?i)\.(?:bmp|gif|jpe?g|png|svg|tiff?)$
+          (?i)\.(?:eot|[ot]tf|woff2?)$
+          (?i)\.(?:docx?|xlsx?|pdf|bin|socket|vsidx|v2|suo|wsuo|.dll|pdb|exe|gltf)$
+          DROP
+          sed -i.bak 's/^[[:space:]]*//' "$tmp/drop"
+          before="$(wc -l < "$tmp/default.toml")"
+          grep -vF -f "$tmp/drop" "$tmp/default.toml" > "$RUNNER_TEMP/gitleaks.toml"
+          after="$(wc -l < "$RUNNER_TEMP/gitleaks.toml")"
+          # Exactly three lines must go. Anything else means the default file
+          # is not the one this step was written for.
+          if [ "$((before - after))" -ne 3 ]; then
+            echo "::error::expected to remove 3 file-type exclusions from the default configuration, removed $((before - after))"
+            exit 1
+          fi
+
+      - name: Scan the new commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          is_commit() { git cat-file -e "$1^{commit}" 2>/dev/null; }
+          zero=0000000000000000000000000000000000000000
+
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request)
+              # Commits on the PR branch that are not on the base branch.
+              is_commit "$PR_BASE_SHA" || { echo "::error::base commit $PR_BASE_SHA is not in the clone"; exit 1; }
+              is_commit "$PR_HEAD_SHA" || { echo "::error::head commit $PR_HEAD_SHA is not in the clone"; exit 1; }
+              trusted="$PR_BASE_SHA"
+              proposed="$PR_HEAD_SHA"
+              range="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+              ;;
+            push)
+              if [ "$PUSH_BEFORE" != "$zero" ] && is_commit "$PUSH_BEFORE"; then
+                # Commits this push added to the branch.
+                trusted="$PUSH_BEFORE"
+                proposed="$PUSH_AFTER"
+                range="${PUSH_BEFORE}..${PUSH_AFTER}"
+              else
+                # No usable previous tip: the branch was just created, or a force
+                # push dropped it. The pushed range cannot be established, so fail
+                # closed. Scanning only the tip would pass commits unscanned, and
+                # scanning everything would hit the known history (see header).
+                echo "::error::previous tip '${PUSH_BEFORE}' is not available, so the pushed range cannot be established. Nothing was scanned. Scan the rewritten commits by hand with BOTH commands in this workflow's header (the commit pass and the net-change pass)."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::unsupported event '${EVENT_NAME}': call this workflow from pull_request_target or push"
+              exit 1
+              ;;
+          esac
+
+          # The only exception route is .gitleaksignore as it is at the TRUSTED
+          # commit (the PR's base, or the previous tip of a push), never the
+          # copy in the commits being scanned. gitleaks also reads a
+          # .gitleaksignore in the directory it scans, so the working-tree copy
+          # (which came from the commits being scanned) is removed first.
+          rm -f .gitleaksignore
+          ignore_dir="$RUNNER_TEMP/gitleaks-ignore"
+          rm -rf "$ignore_dir"; mkdir -p "$ignore_dir"
+          # An entry is a fingerprint: [commit:]file:rule:line. bad_lines prints the
+          # numbers of lines that are neither that, a comment, nor blank. Exactly
+          # three or four fields: gitleaks prints, in full and unredacted, any
+          # entry with another number of fields, so a file path that itself
+          # contains a colon cannot be allow-listed here. Content
+          # is never printed: gitleaks would print a malformed entry in its log, and
+          # a pasted secret must not get there. CR is dropped first because
+          # gitleaks trims an entry before it parses it.
+          # A file containing a NUL byte is refused whole: grep treats such input
+          # as binary and reports nothing for it, which would let any entry
+          # through. -a keeps grep in text mode for other odd bytes.
+          bad_lines() {
+            if [ "$(tr -d '\000' < "$1" | wc -c)" -ne "$(wc -c < "$1")" ]; then printf 'all (the file contains NUL bytes) '; return 0; fi
+            tr -d '\r' < "$1" | grep -anvE '^[[:space:]]*(#.*)?$|^([0-9a-f]{7,64}:)?[^[:space:]:][^:]*:[A-Za-z0-9][A-Za-z0-9._-]*:[0-9]+[[:space:]]*$' | cut -d: -f1 | tr '\n' ' ' || true;
+          }
+
+          # The copy the commits being scanned would leave behind is checked for
+          # shape only (it grants nothing): a malformed file must not be merged.
+          # Only when these commits change the file: an unchanged malformed file
+          # is the base's problem and is handled below without blocking.
+          # "Change" is judged against where the branch started (the merge base
+          # for a pull request, the previous tip for a push): a branch cut from
+          # a base that has since repaired the file did not change it.
+          changed_from="$trusted"
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request)
+              changed_from="$(git merge-base "$trusted" "$proposed" || true)"
+              [ -n "$changed_from" ] || changed_from="$trusted"
+              ;;
+          esac
+          if git cat-file -e "${proposed}:.gitleaksignore" 2>/dev/null \
+             && [ "$(git rev-parse "${proposed}:.gitleaksignore")" != "$(git rev-parse --verify --quiet "${changed_from}:.gitleaksignore" || true)" ]; then
+            git show "${proposed}:.gitleaksignore" > "$RUNNER_TEMP/gitleaks-ignore-proposed"
+            bad="$(bad_lines "$RUNNER_TEMP/gitleaks-ignore-proposed")"
+            rm -f "$RUNNER_TEMP/gitleaks-ignore-proposed"
+            if [ -n "$bad" ]; then
+              echo "::error::.gitleaksignore in these commits has malformed entr(ies) at line(s): ${bad}(content not shown). An entry is [commit:]file:rule:line."
+              exit 1
+            fi
+          fi
+
+          if git cat-file -e "${trusted}:.gitleaksignore" 2>/dev/null; then
+            git show "${trusted}:.gitleaksignore" | tr -d '\r' > "$ignore_dir/.gitleaksignore"
+            bad="$(bad_lines "$ignore_dir/.gitleaksignore")"
+            if [ -n "$bad" ]; then
+              # A malformed file already on the base grants NO exceptions for this
+              # run, and the scan goes ahead. Failing here would also fail the pull
+              # request that repairs the file, which could then only be merged by
+              # bypassing the check.
+              rm -f "$ignore_dir/.gitleaksignore"
+              echo "::warning::.gitleaksignore on the base has malformed entr(ies) at line(s): ${bad}(content not shown). No exceptions apply to this run. Repair the file."
+            else
+              echo "Using .gitleaksignore from ${trusted} ($(grep -cvE '^[[:space:]]*(#.*)?$' "$ignore_dir/.gitleaksignore" || true) entr(ies))"
+            fi
+          else
+            echo "No .gitleaksignore at ${trusted}: no exceptions apply"
+          fi
+          # --diff-merges=remerge makes git show, for a merge commit, what the
+          # committed merge changed on top of the automatic merge: conflict
+          # resolutions and anything else added in the merge itself. Without
+          # it git prints no patch for merges and gitleaks would not see them.
+          # --text makes git print a patch for every file, including files
+          # that .gitattributes marks as binary or "-diff".
+          # --no-renames makes git show a renamed file as a deletion plus a new
+          # file. With rename detection a file moved from an excluded name
+          # (package-lock.json) to an included one shows only as a rename, with
+          # no added lines, and a token in it would pass.
+          log_opts="--diff-merges=remerge --text --no-renames ${range}"
+
+          # remerge only covers two-parent merges: git prints no patch for a
+          # merge with three or more parents (octopus), so one in the range
+          # would go unscanned. Fail rather than pass it.
+          octopus="$(git rev-list --min-parents=3 "$range")"
+          if [ -n "$octopus" ]; then
+            echo "::error::the range contains a merge with more than two parents, which cannot be scanned: ${octopus//$'\n'/ }. Redo it as two-parent merges."
+            exit 1
+          fi
+
+          # gitleaks exits 0 with "no leaks found" when its git log call fails
+          # (bad revision, unsupported option). Run the same git log first so
+          # that case fails the job here instead of passing as a clean scan.
+          # shellcheck disable=SC2086 # log_opts is split into words on purpose
+          git log -p -U0 $log_opts > /dev/null
+          count="$(git rev-list --count "$range")"
+          echo "Scanning ${count} commit(s): git log ${log_opts}"
+
+          report="$RUNNER_TEMP/gitleaks-report.json"
+          rc=0
+          # --config: the configuration built above; a .gitleaks.toml in the
+          # repository is never read. GITLEAKS_CONFIG* in the environment is
+          # cleared for the same reason.
+          # --redact keeps secret values out of the log and the report.
+          # --ignore-gitleaks-allow: a "gitleaks:allow" comment on the line
+          # does not suppress a finding.
+          # Exit code 2 means findings; any other non-zero is a tool error.
+          env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks git . \
+            --config "$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path "$ignore_dir" \
+            --log-opts="$log_opts" \
+            --redact \
+            --ignore-gitleaks-allow \
+            --no-banner \
+            --exit-code 2 \
+            --report-format json \
+            --report-path "$report" || rc=$?
+
+          # Second pass: what the range adds to the base, as ONE change, at the
+          # paths the files end up at after the merge. The commit-by-commit pass above can miss a
+          # token that only reaches a scanned path through a merge: added on one
+          # branch under an excluded name (a lock file), while the other branch
+          # renames that file. git resolves that merge by itself, so the remerge
+          # diff is empty, and each side's own commits show nothing to scan.
+          # A throwaway commit with the head's tree and the base as parent gives
+          # gitleaks exactly that net difference. Its id means nothing, so its
+          # findings cannot be allow-listed by fingerprint; instead one is dropped
+          # when the base ignore file has an entry for the same file:rule:line,
+          # or when the first pass already reported that file, rule and line.
+          net_report="$RUNNER_TEMP/gitleaks-report-net.json"
+          # Which tree and which parent:
+          # - push: the new tip's tree against the previous tip.
+          # - pull request: the tree git would produce by merging the head into
+          #   the CURRENT base, against that base. Files then sit where they
+          #   will sit after the merge (the base may have renamed an excluded
+          #   file since the branch was cut), and nothing the base has since
+          #   removed is counted as added again. If that merge has conflicts
+          #   the pull request cannot be merged as it is; the head's own tree
+          #   against the merge base is scanned instead, and the pass runs
+          #   again when the conflict is resolved.
+          net_parent="$trusted"
+          net_tree="${proposed}^{tree}"
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request)
+              # "git merge-tree -h" itself exits non-zero, so its text is captured
+              # first instead of being piped under pipefail.
+              mt_help="$(git merge-tree -h 2>&1 || true)"
+              case "$mt_help" in
+                *--write-tree*) ;;
+                *) echo "::error::this runner's git has no 'merge-tree --write-tree' (needs git 2.38 or later); the net-change pass cannot run"; exit 1 ;;
+              esac
+              if merged="$(git merge-tree --write-tree "$trusted" "$proposed" 2>/dev/null | head -n 1)" && git cat-file -e "${merged}^{tree}" 2>/dev/null \
+                 && git merge-tree --write-tree "$trusted" "$proposed" >/dev/null 2>&1; then
+                net_tree="$merged"
+              else
+                mb="$(git merge-base "$trusted" "$proposed" || true)"
+                [ -n "$mb" ] || { echo "::error::base and head have no common ancestor; the net change cannot be established"; exit 1; }
+                net_parent="$mb"
+                echo "::notice::the pull request does not merge cleanly into its base; the net-change pass scanned the head against the merge base and will run again once the conflict is resolved"
+              fi
+              ;;
+          esac
+          net_commit="$(GIT_AUTHOR_NAME=scan GIT_AUTHOR_EMAIL=scan@invalid GIT_COMMITTER_NAME=scan GIT_COMMITTER_EMAIL=scan@invalid git commit-tree "$net_tree" -p "$net_parent" -m "net change (not a real commit)")"
+          net_opts="--text --no-renames ${net_parent}..${net_commit}"
+          # shellcheck disable=SC2086 # split into words on purpose
+          git log -p -U0 $net_opts > /dev/null
+          rc_net=0
+          env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML gitleaks git . \
+            --config "$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path "$ignore_dir" \
+            --log-opts="$net_opts" \
+            --redact \
+            --ignore-gitleaks-allow \
+            --no-banner \
+            --exit-code 2 \
+            --report-format json \
+            --report-path "$net_report" || rc_net=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            : # the first pass failed to run; reported below
+          elif [ "$rc_net" -ne 0 ] && [ "$rc_net" -ne 2 ]; then
+            rc="$rc_net"
+          else
+            [ -s "$report" ] || echo '[]' > "$report"
+            [ -s "$net_report" ] || echo '[]' > "$net_report"
+            allowed="$RUNNER_TEMP/gitleaks-allowed.json"
+            if [ -f "$ignore_dir/.gitleaksignore" ]; then
+              # file:rule:line of every base entry, with a leading commit id removed
+              # Backslashes in the path become slashes, as gitleaks itself does when
+              # it reads an entry: the finding it is compared with uses slashes.
+              # sed, not grep -v: a file holding only comments selects no lines,
+              # and grep would end the step with status 1 under pipefail.
+              sed -E '/^[[:space:]]*(#.*)?$/d; s/[[:space:]]+$//; s/^[0-9a-f]{7,64}://; s#\\#/#g' "$ignore_dir/.gitleaksignore" | jq -R . | jq -s . > "$allowed"
+            else
+              echo '[]' > "$allowed"
+            fi
+            jq -n --slurpfile a "$report" --slurpfile b "$net_report" --slurpfile ok "$allowed" '
+              ($a[0] | map("\(.File):\(.RuleID):\(.StartLine)")) as $seen
+              | $a[0] + ($b[0]
+                  | map(select(("\(.File):\(.RuleID):\(.StartLine)") as $k | (($ok[0] | index($k)) == null) and (($seen | index($k)) == null)))
+                  | map(.Commit = "net change"))' > "$report.all"
+            mv "$report.all" "$report"
+            if [ "$(jq length "$report")" -gt 0 ]; then rc=2; else rc=0; fi
+          fi
+          # The job summary has a size limit and a failed upload would hide the
+          # result, so the table is capped; the count above it is always exact.
+          max_rows=50
+          {
+            echo "## gitleaks"
+            echo
+            echo "Range: \`git log ${log_opts}\` (${count} commit(s))"
+            echo
+            if [ "$rc" -eq 0 ]; then
+              echo "No secrets found in the new commits."
+            elif [ "$rc" -eq 2 ]; then
+              total="$(jq length "$report")"
+              echo "**${total} finding(s).** Secret values are redacted."
+              echo
+              echo "| Rule | File | Line | Commit |"
+              echo "| --- | --- | --- | --- |"
+              jq -r --argjson n "$max_rows" '.[:$n][] | "| \(.RuleID) | `\(.File[0:200] | gsub("[|`\r\n]"; "_"))` | \(.StartLine) | \(.Commit[0:12]) |"' "$report"
+              if [ "$total" -gt "$max_rows" ]; then
+                echo
+                echo "Only the first ${max_rows} are listed."
+              fi
+              echo
+              echo "\"net change\" in the Commit column means the finding is in what the whole range adds to the base, not in one commit (for example a file that reached a scanned path through a merge). Remove the secret from the branch history (amend or rebase, not a follow-up commit) and rotate it. A proven false positive is allow-listed by its fingerprint in \`.gitleaksignore\`, merged in its own change first: the scan reads that file from the base, not from the commits being scanned."
+            else
+              echo "gitleaks failed to run (exit code ${rc}). See the job log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::gitleaks found secrets in the new commits (values redacted). See the job summary."
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::gitleaks failed to run (exit code ${rc})"
+          fi
+          exit "$rc"
