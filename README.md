@@ -79,6 +79,11 @@ commit) and rotate it. A proven false positive is allow-listed by its
 fingerprint (`[commit:]file:rule:line`) in `.gitleaksignore`, merged in its own
 change first, because the scan reads that file from the base.
 
+Merging the exception does not re-run the pull request's scan, and re-running
+the old run reuses the old base. Push a new commit to the pull request's branch
+(an empty commit is enough; it keeps the finding's commit fingerprint) so a new
+scan runs against the base that now holds the exception.
+
 ### Running it by hand
 
 The workflow header gives the exact commands for both passes. Work in a
