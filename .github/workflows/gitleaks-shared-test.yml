@@ -1,0 +1,62 @@
+name: Shared secret-scan workflow tests
+
+# Runs the shared secret-scan workflow's own scan script against throwaway
+# repositories (scripts/test-gitleaks-shared.sh). Each protection has a case
+# that passes only with it in place and a variant that shows it is the
+# protection, not something else, that blocks. Tokens are generated at run
+# time inside a temp directory and are never printed or committed.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/gitleaks-reusable.yml
+      - .github/workflows/gitleaks-shared-test.yml
+      - scripts/test-gitleaks-shared.sh
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gitleaks-reusable.yml
+      - .github/workflows/gitleaks-shared-test.yml
+      - scripts/test-gitleaks-shared.sh
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shared secret-scan workflow tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the gitleaks version the shared workflow pins (checksum verified)
+        run: |
+          set -euo pipefail
+          # PyYAML for the system python3. Use it if the image already has it;
+          # otherwise take the distribution package, because a bare pip install
+          # into the system Python is refused on images that mark it as
+          # externally managed.
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3-yaml; }
+          python3 -c 'import yaml'
+          # Version and checksum are read from the shared workflow, so this
+          # job always tests the binary that workflow would install.
+          eval "$(python3 - <<'PY'
+          import yaml
+          d = yaml.safe_load(open(".github/workflows/gitleaks-reusable.yml"))
+          s = [x for x in d["jobs"]["gitleaks"]["steps"] if x.get("name", "").startswith("Install gitleaks")][0]
+          print("V=%s" % s["env"]["GITLEAKS_VERSION"])
+          print("S=%s" % s["env"]["GITLEAKS_SHA256"])
+          PY
+          )"
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$tmp/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+          echo "${S}  $tmp/gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$tmp/gitleaks" "$RUNNER_TEMP/bin/gitleaks"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Run the tests
+        run: bash scripts/test-gitleaks-shared.sh .github/workflows/gitleaks-reusable.yml

@@ -1,0 +1,28 @@
+name: Secret scan (gitleaks)
+
+# Scans this repository with its own shared workflow.
+#
+# pull_request, not pull_request_target: this is a public repository, and
+# GitHub blocks pull_request_target by default in public repositories from
+# 2026-12-02. Under pull_request a fork's pull request runs with a read-only
+# token and no secrets, which is all the scan needs. The pull request's own
+# copy of this file and of the shared workflow runs, so changes to either
+# are reviewed before merge; the push scan on main always runs main's copy.
+
+on:
+  pull_request:
+    # 'edited' as well as the defaults: changing a pull request's base branch
+    # is an 'edited' event, and without it a retargeted pull request would keep
+    # a result computed against its old base.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    uses: ./.github/workflows/gitleaks-reusable.yml
+    with:
+      runs-on: ubuntu-latest
